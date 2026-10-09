@@ -22,18 +22,12 @@ class ModelTier(str, Enum):
     FRONTIER = "frontier"          # expensive: multi-doc reasoning, complex analysis
 
 
-# $ per 1M tokens (input, output) — update from provider pricing pages.
-# Kept as data, not hardcoded logic, so it can be hot-reloaded from a
-# config service / feature flag store in production.
 PRICING_PER_MILLION = {
     ModelTier.EXTRACTION: {"input": 0.15, "output": 0.60},
     ModelTier.STANDARD:   {"input": 3.00, "output": 15.00},
     ModelTier.FRONTIER:   {"input": 15.00, "output": 75.00},
 }
 
-# Rough chars-per-token for English financial text (tables/numbers skew
-# this lower than prose — treat as an estimate, not ground truth; the
-# gateway should reconcile against actual usage returned by the API).
 CHARS_PER_TOKEN = 3.8
 
 
@@ -63,10 +57,6 @@ def estimate_cost(
     input_cost = (input_tokens / 1_000_000) * pricing["input"]
     output_cost = (expected_output_tokens / 1_000_000) * pricing["output"]
 
-    # Rough latency model: base network/queue overhead + per-token
-    # generation time, which varies significantly by tier. These
-    # constants should be recalibrated from real p50/p95 traces
-    # (Phase 7 observability feeds this back).
     base_latency = {ModelTier.EXTRACTION: 150, ModelTier.STANDARD: 300, ModelTier.FRONTIER: 500}
     ms_per_output_token = {ModelTier.EXTRACTION: 8, ModelTier.STANDARD: 18, ModelTier.FRONTIER: 35}
 

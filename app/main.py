@@ -7,9 +7,19 @@ This is the equivalent of Program.cs wiring up controllers in
 ASP.NET Core.
 """
 
+from dotenv import load_dotenv
+
+# Must run BEFORE importing anything that reads os.environ at import
+# time (like the Gemini client in phase1/streaming_api.py) — this is
+# the Python equivalent of appsettings.json being loaded before
+# Program.cs builds the service container.
+load_dotenv()
+
 from fastapi import FastAPI
 
 from app.phase1.streaming_api import router as phase1_router
+from app.phase2.ingestion_api import router as phase2_router
+
 
 app = FastAPI(
     title="FinAssist - Enterprise Financial Intelligence & Portfolio Assistant",
@@ -17,6 +27,7 @@ app = FastAPI(
 )
 
 app.include_router(phase1_router)
+app.include_router(phase2_router)
 
 
 @app.get("/health")

@@ -10,19 +10,21 @@ action result in ASP.NET Core streamed over `text/event-stream` —
 FastAPI's StreamingResponse is the equivalent primitive.
 """
 
-import asyncio
 import json
+import os
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
+from google import genai
 from pydantic import BaseModel
 
-# APIRouter is FastAPI's equivalent of an ASP.NET Core Controller:
-# a self-contained group of endpoints that main.py mounts onto the
-# single app instance, instead of every file creating its own app.
 router = APIRouter(prefix="/v1", tags=["query"])
+
+_gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+# GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 
 
 class QueryRequest(BaseModel):
@@ -36,46 +38,56 @@ class SSEEvent:
     data: dict
 
     def encode(self) -> str:
-        # SSE wire format: "event: <name>\ndata: <json>\n\n"
         return f"event: {self.event}\ndata: {json.dumps(self.data)}\n\n"
 
 
-async def fake_llm_token_stream(query: str):
+async def real_llm_token_stream(query: str):
     """
-    Stand-in for the real model call (Phase 3 replaces this with the
-    Model Gateway). Yields tokens one at a time to simulate generation.
+    Real Gemini call, streamed. Phase 3's Model Gateway will wrap this
+    with retries, provider fallback, and semantic caching — this is
+    the bare, single-provider version for Phase 1.
     """
-    response_text = (
-        f"Based on the retrieved filing sections, here is the analysis "
-        f"relevant to: '{query}'. Revenue grew year-over-year, driven "
-        f"primarily by the cloud services segment."
+    system_instruction = (
+        "You are a financial analysis assistant. Only discuss information "
+        "that would come from the provided filing context. Never state a "
+        "specific number as fact unless it was given to you in the context."
     )
-    for word in response_text.split(" "):
-        await asyncio.sleep(0.03)  # simulated per-token generation latency
-        yield word + " "
+
+    stream = await _gemini_client.aio.models.generate_content_stream(
+        model=GEMINI_MODEL,
+        contents=query,
+        config=genai.types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            temperature=0.2,
+        ),
+    )
+    async for chunk in stream:
+        if chunk.text:
+            yield chunk.text
 
 
 async def event_generator(req: QueryRequest):
     start = time.perf_counter()
     first_token_sent = False
 
-    # In the real pipeline: retrieval happens here BEFORE generation
-    # starts, and citation events are emitted as sources are pulled,
-    # not invented after the fact.
     yield SSEEvent("citation", {
         "source": req.document_id or "10-K-2025-Q4",
         "section": "Item 7 - MD&A",
     }).encode()
 
     buffer = ""
-    async for token in fake_llm_token_stream(req.query):
-        if not first_token_sent:
-            ttft_ms = int((time.perf_counter() - start) * 1000)
-            yield SSEEvent("metric", {"ttft_ms": ttft_ms}).encode()
-            first_token_sent = True
+    try:
+        async for token in real_llm_token_stream(req.query):
+            if not first_token_sent:
+                ttft_ms = int((time.perf_counter() - start) * 1000)
+                yield SSEEvent("metric", {"ttft_ms": ttft_ms}).encode()
+                first_token_sent = True
 
-        buffer += token
-        yield SSEEvent("token", {"text": token}).encode()
+            buffer += token
+            yield SSEEvent("token", {"text": token}).encode()
+    except Exception as exc:
+        yield SSEEvent("error", {"message": "Model provider error. Please retry."}).encode()
+        return
 
     total_ms = int((time.perf_counter() - start) * 1000)
     yield SSEEvent("done", {
@@ -92,6 +104,6 @@ async def stream_query(req: QueryRequest):
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # disable nginx buffering, critical for real TTFT
+            "X-Accel-Buffering": "no",
         },
     )
