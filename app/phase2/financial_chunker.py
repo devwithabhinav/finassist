@@ -39,6 +39,18 @@ def split_into_sections(text: str) -> list[tuple[str, str, str]]:
         item_number = m.group(1)
         title = m.group(2).strip() or "(untitled)"
         section_text = text[start:end].strip()
+        # TOCs repeat the real Item headings with little or no intervening
+        # content (often just page numbers or a Part heading). Do not discard
+        # short real sections merely because they are short.
+        repeated_later = any(
+            later.group(1).upper() == item_number.upper()
+            for later in matches[i + 1:]
+        )
+        if not section_text or (
+            len(section_text) < MIN_CHUNK_CHARS
+            and (repeated_later or section_text.isdecimal())
+        ):
+            continue
         sections.append((item_number, title, section_text))
     return sections
 
