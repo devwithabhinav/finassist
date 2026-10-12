@@ -36,8 +36,16 @@ def _table_to_markdown(table_tag) -> str:
 def html_to_text_preserving_tables(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
 
+    # Keep headings with inline formatting on one line so the chunker can
+    # associate the complete statement name with the following table.
+    for heading in soup.find_all(re.compile(r"^h[1-6]$")):
+        heading.replace_with("\n" + heading.get_text(" ", strip=True) + "\n")
+
     for table in soup.find_all("table"):
         markdown = _table_to_markdown(table)
+        caption_tag = table.find("caption")
+        if markdown and caption_tag:
+            markdown = caption_tag.get_text(" ", strip=True) + "\n" + markdown
         table.replace_with("\n" + markdown + "\n" if markdown else "")
 
     text = soup.get_text(separator="\n")

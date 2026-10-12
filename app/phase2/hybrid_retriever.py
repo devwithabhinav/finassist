@@ -11,12 +11,19 @@ which live on incompatible scales) into one ordering.
 
 from abc import ABC, abstractmethod
 import hashlib
+import time
 from dataclasses import dataclass
 
+import httpx
 import numpy as np
+from google.genai.errors import APIError
 from rank_bm25 import BM25Okapi
 
 from app.phase2.financial_chunker import Chunk
+
+EMBEDDING_BATCH_SIZE = 32
+EMBEDDING_MAX_RETRIES = 3
+EMBEDDING_BACKOFF_SECONDS = 1.0
 
 
 class EmbeddingProvider(ABC):
@@ -81,10 +88,39 @@ class HybridIndex:
         self._dense_vectors: np.ndarray | None = None
 
     def build(self, chunks: list[Chunk]) -> None:
-        self.chunks = chunks
+        """Embed bounded batches, retrying transient failures of only that batch.
+
+        Publish the new index only after every batch succeeds so a failed
+        rebuild leaves the previous searchable index intact.
+        """
+        if not chunks:
+            raise ValueError("Cannot build an index without chunks.")
+
         tokenized = [c.text.lower().split() for c in chunks]
-        self._bm25 = BM25Okapi(tokenized)
-        self._dense_vectors = self.embedding_provider.embed([c.text for c in chunks])
+        bm25 = BM25Okapi(tokenized)
+        batches = []
+        for start in range(0, len(chunks), EMBEDDING_BATCH_SIZE):
+            texts = [c.text for c in chunks[start:start + EMBEDDING_BATCH_SIZE]]
+            for attempt in range(EMBEDDING_MAX_RETRIES + 1):
+                try:
+                    vectors = self.embedding_provider.embed(texts)
+                    break
+                except (APIError, httpx.TransportError) as exc:
+                    if isinstance(exc, APIError) and exc.code not in (
+                        408, 429, 500, 502, 503, 504
+                    ):
+                        raise
+                    if attempt == EMBEDDING_MAX_RETRIES:
+                        raise
+                    time.sleep(EMBEDDING_BACKOFF_SECONDS * 2 ** attempt)
+            if vectors.ndim != 2 or len(vectors) != len(texts):
+                raise ValueError("Embedding provider returned an invalid batch shape.")
+            batches.append(vectors)
+
+        dense_vectors = np.concatenate(batches, axis=0)
+        self.chunks = list(chunks)
+        self._bm25 = bm25
+        self._dense_vectors = dense_vectors
 
     def search(self, query: str, k: int = 5, rrf_k: int = 60) -> list[SearchResult]:
         bm25_scores = self._bm25.get_scores(query.lower().split())

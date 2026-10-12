@@ -16,6 +16,14 @@ TABLE_BLOCK_RE = re.compile(r"(?:^\|.*\|\s*$\n?){2,}", re.MULTILINE)
 MAX_CHUNK_CHARS = 1800
 MIN_CHUNK_CHARS = 200
 
+TABLE_UNITS_RE = re.compile(
+    r"\b(?:in\s+(?:(?:U\.?S\.?\s+)?dollars?\s+in\s+)?"
+    r"(?:thousands|millions|billions)|"
+    r"(?:U\.?S\.?\s+)?dollars?\s+in\s+(?:thousands|millions|billions))\b"
+    r"[^\n|]*",
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class Chunk:
@@ -112,17 +120,55 @@ def _chunk_prose(text: str) -> list[str]:
     return chunks
 
 
+def _table_context(section_text: str) -> list[dict]:
+    """Use only nearby explicit labels; never infer a unit from values."""
+    contexts = []
+    previous_end = 0
+    for match in TABLE_BLOCK_RE.finditer(section_text):
+        nearby = [
+            line.strip() for line in section_text[previous_end:match.start()].splitlines()
+            if line.strip()
+        ][-4:]
+        units = None
+        caption = None
+        # Prefer a unit label above the table, then check its header rows.
+        for line in list(reversed(nearby)) + match.group().splitlines()[:3]:
+            unit_match = TABLE_UNITS_RE.search(line)
+            if unit_match and units is None:
+                units = unit_match.group().strip().rstrip(") .")
+        for line in reversed(nearby):
+            if TABLE_UNITS_RE.search(line):
+                continue
+            if len(line) <= 160 and not line.endswith((".", "?", "!")):
+                caption = line
+            break
+        contexts.append({"caption": caption, "units": units})
+        previous_end = match.end()
+    return contexts
+
+
 def chunk_filing(text: str, doc_id: str) -> list[Chunk]:
     chunks: list[Chunk] = []
     for item_number, title, section_text in split_into_sections(text):
+        table_contexts = iter(_table_context(section_text))
         for idx, (chunk_type, chunk_text) in enumerate(split_section_preserving_tables(section_text)):
+            metadata = {"doc_id": doc_id}
+            if chunk_type == "table":
+                metadata.update(next(table_contexts))
+                metadata["section_title"] = title
+                context_header = [f"Section: Item {item_number}. {title}"]
+                if metadata["caption"]:
+                    context_header.append(f"Caption: {metadata['caption']}")
+                if metadata["units"]:
+                    context_header.append(f"Units: {metadata['units']}")
+                chunk_text = "\n".join(context_header) + "\n\n" + chunk_text
             chunks.append(Chunk(
                 chunk_id=f"{doc_id}:item{item_number}:{idx}",
                 text=chunk_text,
                 section=f"Item {item_number}",
                 section_title=title,
                 chunk_type=chunk_type,
-                metadata={"doc_id": doc_id},
+                metadata=metadata,
             ))
     return chunks
 

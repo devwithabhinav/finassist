@@ -1,270 +1,231 @@
-**Phase 2 Intent**
+﻿# Phase 2: Financial document retrieval
 
-Phase 2 builds the retrieval half of a financial RAG system:
-
-```text
-SEC ticker
-  -> CIK lookup
-  -> latest 10-K HTML
-  -> cleaned text with tables
-  -> section-aware chunks
-  -> BM25 + embeddings
-  -> hybrid search results
-```
-
-The main API is wired through `main.py:1-37`:
-
-- `POST /v2/ingest`: fetches and indexes a filing.
-- `POST /v2/search`: searches the indexed filing.
-
-## Module and Symbol Responsibilities
-
-### `edgar_fetcher.py:1-77`
-
-This module obtains real SEC filings.
-
-- `get_cik_for_ticker(ticker)`: converts a ticker such as `AAPL` into its SEC CIK identifier.
-- `get_latest_10k_url(cik)`: finds the latest `10-K` submission and constructs its document URL.
-- `fetch_filing_html(document_url)`: downloads the filing HTML.
-- `fetch_latest_10k(ticker)`: coordinates the complete fetch process and returns filing metadata plus HTML.
-- `SEC_USER_AGENT` and `HEADERS`: identify the client to SEC EDGAR, as required by SEC policy.
-
-You learned that external data sources often require proper identification, rate limiting, timeouts, and error handling.
-
-### `html_parser.py:1-62`
-
-This module transforms HTML into searchable text.
-
-- `_table_to_markdown(table_tag)`: converts HTML tables into pipe-delimited Markdown-like text.
-- `html_to_text_preserving_tables(html)`: removes HTML formatting while preserving table content.
-
-The important design decision is that tables are financial evidence, not decoration. Converting them to text makes values searchable while retaining rows and columns reasonably well.
-
-### `financial_chunker.py:1-145`
-
-This module creates retrieval-ready units.
-
-- `Chunk`: stores the text and metadata for one searchable unit.
-- `split_into_sections(text)`: identifies sections such as Item 1, Item 1A, and Item 7.
-- `split_section_preserving_tables(section_text)`: keeps tables intact and chunks prose separately.
-- `_chunk_prose(text)`: divides long prose into chunks up to `MAX_CHUNK_CHARS`.
-- `chunk_filing(text, doc_id)`: builds the final list of `Chunk` objects.
-
-You learned that chunking is not merely splitting text every N characters. Financial documents have meaningful boundaries:
-
-- SEC section boundaries
-- paragraph boundaries
-- table boundaries
-- document and filing metadata
-
-The `Chunk` metadata later supports filtering, citations, and debugging.
-
-### `hybrid_retriever.py:1-146`
-
-This module searches the chunks using two retrieval strategies.
-
-- `EmbeddingProvider`: abstract interface for any embedding implementation.
-- `GeminiEmbeddingProvider`: produces real semantic embeddings through Gemini.
-- `FakeEmbeddingProvider`: produces deterministic test vectors without network access.
-- `SearchResult`: combines a chunk with its sparse rank, dense rank, and RRF score.
-- `HybridIndex.build(chunks)`: builds the BM25 and embedding indexes.
-- `HybridIndex.search(query, k, rrf_k)`: performs both searches and combines their rankings.
-
-The two search types have different strengths:
-
-- BM25 finds exact terms, names, numbers, and phrases.
-- Embeddings find semantically similar wording.
-- Reciprocal Rank Fusion combines their rankings without comparing incompatible raw scores.
-
-One important lesson: the fake embedding provider is useful for testing mechanics, but it does not understand meaning. It should never be used to judge real retrieval quality.
-
-### `ingestion_api.py:1-122`
-
-This module exposes the pipeline through FastAPI.
-
-- `IngestRequest`: validates the ticker and chunk limit.
-- `IngestResponse`: reports filing and chunk statistics.
-- `ingest_filing(req)`: performs fetch, parse, chunk, embedding, and in-memory indexing.
-- `SearchRequest`: validates search input.
-- `search_filing(req)`: retrieves results from the ticker’s in-memory index.
-
-The `_indexes` dictionary is a simple cache:
-
-```python
-_indexes[ticker] = HybridIndex(...)
-```
-
-It is appropriate for learning, but the index disappears when the server restarts and cannot be safely shared across multiple workers.
-
-### `entity_graph.py:1-76`
-
-This is an additional GraphRAG experiment.
-
-- `extract_entities(chunk_text)`: asks Gemini to extract entities and relationships as JSON.
-- `EntityGraph`: stores those relationships in a NetworkX `MultiDiGraph`.
-- `EntityGraph.ingest_chunk(...)`: extracts and stores entities and edges.
-- `EntityGraph.find_connected(entity_name)`: returns directly connected incoming and outgoing relationships.
-
-This supports questions such as:
-
-> Which suppliers are connected to this company?
-
-It is different from vector search. Vector search finds relevant passages; the graph represents explicit relationships.
-
-However, this module is currently not connected to `/v2/ingest` or `/v2/search`. It is a standalone experiment.
-
-## What You Have Learned
-
-Phase 2 has taught you several important AI engineering concepts:
-
-1. Real-world documents require ingestion and normalization before an LLM can use them.
-2. Financial tables must be preserved because they contain critical evidence.
-3. Chunk size and boundaries directly affect retrieval quality.
-4. Metadata is essential for traceability and future citations.
-5. BM25 and embeddings solve different retrieval problems.
-6. Hybrid retrieval is often more reliable than relying on only one search method.
-7. RRF combines rankings rather than incompatible raw scores.
-8. Embedding providers should be abstracted behind an interface.
-9. External APIs require timeouts, headers, rate limits, and useful error responses.
-10. Retrieval is not generation. Phase 2 finds evidence, but it does not yet produce a grounded answer.
-
-Together, Phase 1 and Phase 2 are close to a complete RAG foundation:
+Phase 2 turns SEC 10-K HTML or an uploaded PDF into searchable evidence. It also extracts entities and relationships into a persistent graph. It returns passages and relationships; it does not yet pass retrieved evidence to Phase 1 to generate grounded answers.
 
 ```text
-Phase 2: retrieve financial evidence
-Phase 1: generate and stream an answer
-Next: connect the retrieved evidence to the model prompt
+SEC ticker -> latest 10-K HTML --+
+                               +-> text with markdown tables -> section-aware chunks
+PDF upload -> PDF extraction --+                                  |
+                                                                 +-> BM25 + embeddings -> RRF search
+                                                                 +-> entity extraction -> JSON graph -> relationship lookup
 ```
 
-## Open Questions and Missing Pieces
+## Current status
 
-The biggest open question is:
+The six Phase 2 implementation items now have code and automated coverage:
 
-> How will retrieved chunks be passed into Phase 1 so Gemini answers only from filing evidence and cites the source?
+- Ignore short repeated table-of-contents Item headings while preserving short real sections.
+- Batch embedding calls with bounded retry and exponential backoff.
+- Attach table caption/heading, units, and section title to both chunk text and metadata.
+- Extract PDF text and tables using pdfplumber.
+- Build and query entity graphs through the API, persist them, and reload them at startup.
+- Test parsing, chunking, RRF fusion, PDF ingestion, graph persistence, and failure handling. GitHub Actions runs pytest on every push.
 
-Several implementation gaps remain:
+The latest local run passed 46 tests using the project `.venv` (Python 3.13.9); CI is configured for Python 3.12. Two deprecation warnings originate from Starlette dependencies. These tests use fake providers and do not establish live SEC/Gemini compatibility or real retrieval quality. CI execution on GitHub still needs to be checked after pushing.
 
-- Only the first `max_chunks` are indexed, so the default request searches only the first 10 chunks of a filing.
-- `_indexes` is in memory and disappears after restart.
-- Search results do not return `chunk_id`, filing date, section title, or document URL, so citations are incomplete.
-- The parser does not fully handle `rowspan`, `colspan`, nested tables, or complex SEC formatting.
-- The section regex may miss unusual headings or accidentally match text that resembles an SEC heading.
-- The chunker has no overlap between prose chunks, which can lose context at boundaries.
-- The Gemini embedding calls are synchronous inside `async` FastAPI endpoints.
-- `SearchRequest.k` has no validation range.
-- There are no automated tests for parser correctness, chunk boundaries, ranking behavior, API errors, or citation metadata.
-- `entity_graph.py` has no error handling for malformed model JSON and currently supports only direct one-hop lookups.
-- The entity graph is not persisted and is not integrated with the filing index.
-- The hardcoded SEC user-agent contains a personal email address and should eventually come from configuration.
-- The current retrieval system returns passages but does not evaluate precision, recall, ranking quality, or answer faithfulness.
+## Run on Windows
 
-## Recommended Next Milestone
+Run commands from the repository root. Python 3.12 is the project target. If `.venv` does not exist, create it with `py -3.12 -m venv .venv`.
 
-The next meaningful milestone is to connect the systems:
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
+```
 
-1. Ingest the full filing or use a deliberate indexing limit.
-2. Search for the user’s question.
-3. Pass the top chunks into the Phase 1 Gemini prompt.
-4. Return citations containing document ID, filing date, section, and chunk ID.
-5. Instruct the model to say when the evidence is insufficient.
-6. Add a small evaluation set with known questions and expected filing passages.
+Set `GEMINI_API_KEY` in `.env`. `app/main.py` loads it before importing routers. SEC ingestion also uses the identifying `SEC_USER_AGENT` configured in `edgar_fetcher.py`. PDF ingestion does not contact SEC, but indexing still requires Gemini embeddings.
 
-That would turn Phase 2 from a search demonstration into a genuinely grounded financial question-answering system.
+Use the same Python executable for installing dependencies, running the server, and running tests. A bare `python`, `pip`, or `uvicorn` can resolve to a different system/Conda environment. If startup reports `No module named 'pdfplumber'`, install requirements with the `.venv` command above, stop the failed reloader with Ctrl+C, and restart.
 
----------------------------------------------------------------------------------------------
+- Swagger UI: http://127.0.0.1:8000/docs
+- Health check: http://127.0.0.1:8000/health
+- Stop the server: Ctrl+C
 
-**Recommended Workflow**
+## API reference
 
-Work through the pipeline in small steps. Keep the server running in one PowerShell window so the in-memory index remains available while you search.
+| Method and path | Input | Result |
+|---|---|---|
+| `POST /v2/ingest` | JSON: `ticker`, optional `max_chunks` | Fetch and index the latest SEC 10-K; return filing date and chunk counts. |
+| `POST /v2/ingest-pdf` | Multipart: `file`, `ticker`, optional `max_chunks` | Parse and index a PDF under a ticker or arbitrary label; return chunk counts. |
+| `POST /v2/search` | JSON: `ticker`, `query`, optional `k` | Return ranked passages with section, section title, metadata, chunk type, text, and RRF score. |
+| `POST /v2/graph/build` | JSON: `ticker` | Extract a graph from that ticker's already-indexed chunks, save it, and return node/relationship counts. |
+| `GET /v2/graph/{ticker}/entity/{name}` | Ticker/label and exact entity name in URL | Return direct incoming and outgoing relationships. |
+
+Both ingestion routes default to `max_chunks=10`, with an allowed range of 1 to 100. They index the first chunks in document order, not the most relevant chunks. `table_chunk_count` counts indexed tables; `total_chunk_count` counts all parsed chunks. The PDF response has no filing date because uploaded PDFs do not supply verified filing metadata.
+
+Tickers/labels are stored in uppercase. Search and graph building use the same indexed chunks. Ingesting again under the same key replaces its search index; graph rebuilding is a separate operation.
+
+### 1. Ingest SEC HTML
+
+```powershell
+$ingest = Invoke-RestMethod -Method Post `
+  -Uri "http://127.0.0.1:8000/v2/ingest" `
+  -ContentType "application/json" `
+  -Body '{"ticker":"AAPL","max_chunks":10}'
+$ingest
+```
+
+Check `filing_date`, `chunk_count`, `total_chunk_count`, and `table_chunk_count`. Ten chunks are useful for a small initial test but may not reach risk factors or financial statements. Increasing the limit uses more embedding quota.
+
+### 2. Alternatively, upload a PDF
+
+In Swagger UI, select `POST /v2/ingest-pdf`, click **Try it out**, choose a PDF for `file`, enter `SAMPLE` for `ticker`, and set `max_chunks` to 10 or 100. Execute the request.
+
+From PowerShell, use `curl.exe` (rather than the PowerShell `curl` alias):
+
+```powershell
+curl.exe -X POST "http://127.0.0.1:8000/v2/ingest-pdf" `
+  -F "file=@C:/path/to/filing.pdf;type=application/pdf" `
+  -F "ticker=SAMPLE" `
+  -F "max_chunks=100"
+```
+
+The PDF parser extracts selectable text and detected ruled tables. Empty, unreadable, encrypted-with-password, and image-only PDFs produce a clean 400 response. OCR is not implemented.
+
+### 3. Search the indexed document
+
+```powershell
+$search = Invoke-RestMethod -Method Post `
+  -Uri "http://127.0.0.1:8000/v2/search" `
+  -ContentType "application/json" `
+  -Body '{"ticker":"AAPL","query":"What are the main products and services?","k":3}'
+$search.results | Format-List section, section_title, chunk_type, metadata, rrf_score, text
+```
+
+Use `SAMPLE` instead of `AAPL` to search the uploaded PDF. `k` defaults to 5. Read the returned text and compare it with the original document. RRF scores express ranking, not confidence or probability. Missing evidence may be outside the indexed prefix.
+
+### 4. Build the graph
+
+```powershell
+$graph = Invoke-RestMethod -Method Post `
+  -Uri "http://127.0.0.1:8000/v2/graph/build" `
+  -ContentType "application/json" `
+  -Body '{"ticker":"AAPL"}'
+$graph
+```
+
+This makes additional Gemini generation calls over the indexed chunks. It does not fetch a filing or ingest missing chunks. It returns `ticker`, `node_count`, and `relationship_count`. An empty extracted graph can be a valid result.
+
+### 5. Query relationships
+
+Entity names are exact and case-sensitive. Use a name present in the extracted graph; the name below is illustrative and is not guaranteed to be extracted from a particular filing.
+
+```powershell
+$entity = [uri]::EscapeDataString("Apple Inc.")
+$connections = Invoke-RestMethod `
+  -Uri "http://127.0.0.1:8000/v2/graph/AAPL/entity/$entity"
+$connections.relationships | Format-List source, relation, target, doc
+```
+
+A relationship contains `source`, `relation`, `target`, and `doc` (source document ID). An unknown entity returns an empty relationship list. A missing ticker graph returns 404. There is currently no endpoint listing all entity names, and graph results do not automatically augment `/v2/search`.
+
+## Module responsibilities
+
+| Module | Responsibility |
+|---|---|
+| `edgar_fetcher.py` | Resolve ticker to CIK, locate the latest 10-K, and download HTML with identifying headers and request timeouts. |
+| `html_parser.py` | Convert tables to markdown pipes, preserve captions, normalize headings with inline elements, and flatten other HTML. |
+| `pdf_parser.py` | Extract text and tables in reading order, omit table characters from prose to prevent duplication, and normalize bad/empty PDF errors. |
+| `financial_chunker.py` | Detect Item sections, filter likely TOC entries, chunk prose, keep tables atomic, and attach table context. |
+| `hybrid_retriever.py` | Define the embedding interface and real/fake providers; build BM25/dense indexes and combine search ranks with RRF. |
+| `entity_graph.py` | Validate extracted JSON, build a NetworkX `MultiDiGraph`, find connected edges, and save/load node-link JSON. |
+| `ingestion_api.py` | Expose ingestion, search, graph building, and graph lookup; load persisted graphs through the router lifespan. |
+
+### Chunking and table context
+
+`Chunk` carries `chunk_id`, `text`, `section`, `section_title`, `chunk_type`, and `metadata`. Prose is chunked at paragraph/word boundaries with a target maximum of 1,800 characters. Tables are never split to satisfy that limit.
+
+Table chunks contain a header like this before the complete pipe table:
 
 ```text
-+-----------------------------------------------+
-| 1. Start the FastAPI app                      |
-+----------------------+------------------------+
-                       |
-                       v
-+-----------------------------------------------+
-| 2. POST /v2/ingest with a company ticker       |
-+----------------------+------------------------+
-                       |
-                       v
-+-----------------------------------------------+
-| 3. Find the company's latest 10-K on SEC EDGAR |
-+----------------------+------------------------+
-                       |
-                       v
-+-----------------------------------------------+
-| 4. Download HTML and convert it to clean text  |
-|    while preserving tables                    |
-+----------------------+------------------------+
-                       |
-                       v
-+-----------------------------------------------+
-| 5. Split text into section-aware chunks        |
-|    and keep each table together                |
-+----------------------+------------------------+
-                       |
-                       v
-+-----------------------------------------------+
-| 6. Build keyword (BM25) and embedding indexes  |
-+----------------------+------------------------+
-                       |
-                       v
-+-----------------------------------------------+
-| 7. POST /v2/search with a question             |
-+----------------------+------------------------+
-                       |
-                       v
-+-----------------------------------------------+
-| 8. Rank results and combine rankings with RRF  |
-+----------------------+------------------------+
-                       |
-                       v
-+-----------------------------------------------+
-| 9. Inspect the retrieved filing passages       |
-+----------------------+------------------------+
-                       |
-                       v
-+-----------------------------------------------+
-| 10. Next: pass evidence to Phase 1 and answer  |
-|     with citations to the filing               |
-+-----------------------------------------------+
+Section: Item 7. Management's Discussion and Analysis
+Caption: Consolidated Statements of Operations
+Units: in millions
+
+| Metric | 2025 | 2024 |
+|---|---|---|
+| Revenue | 412 | 365 |
 ```
 
-1. **Prepare and start the app.** Confirm `.env` contains a valid `GEMINI_API_KEY`, and that `SEC_USER_AGENT` in `edgar_fetcher.py` identifies you with a contact email. From the project root, run:
+Metadata includes `doc_id`, `caption`, `units`, and `section_title`. Caption and units detection is heuristic: it checks nearby preceding lines and unit labels in the table's first rows. Missing caption/units are `null` in metadata and omitted from the text header. Units are not inferred from numeric values. HTML captions are retained before conversion; PDFs use extracted surrounding text.
 
-	```powershell
-	.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
-	```
+TOC filtering skips empty sections and short repeated Item entries or page-number-only bodies. Short genuine sections remain supported, but unusual filing layouts still need manual validation.
 
-2. **Ingest one filing.** In a second PowerShell window, fetch and index a filing. Start with a familiar public company, such as Apple:
+### Embedding batches and RRF
 
-	```powershell
-	$ingest = Invoke-RestMethod -Method Post `
-	  -Uri "http://127.0.0.1:8000/v2/ingest" `
-	  -ContentType "application/json" `
-	  -Body '{"ticker":"AAPL","max_chunks":10}'
-	$ingest
-	```
+`HybridIndex.build()` sends batches of 32 texts. For API status codes 408, 429, 500, 502, 503, and 504, or HTTPX transport errors, it retries only the failed batch up to three times, waiting 1, 2, then 4 seconds. Other API errors fail immediately. Invalid embedding shapes are rejected. A failed rebuild preserves the previous index.
 
-	Check the returned filing date and chunk counts. `chunk_count` is how many chunks were indexed; `total_chunk_count` is how many the full filing produced. The default selects the first 10 chunks in filing order, not the 10 most relevant chunks.
+`GeminiEmbeddingProvider` uses `gemini-embedding-001` and also has an internal 100-text batch limit. `FakeEmbeddingProvider` generates repeatable hash-based vectors for tests; it does not model semantic similarity.
 
-3. **Search for evidence.** Ask a question that should be answered by a specific filing section:
+Search independently ranks BM25 keyword scores and cosine embedding similarity. For each chunk it adds:
 
-	```powershell
-	$search = Invoke-RestMethod -Method Post `
-	  -Uri "http://127.0.0.1:8000/v2/search" `
-	  -ContentType "application/json" `
-	  -Body '{"ticker":"AAPL","query":"What risks does the company describe?","k":5}'
-	$search.results | Format-List section, chunk_type, rrf_score, text
-	```
+```text
+RRF score = 1 / (rrf_k + sparse_rank) + 1 / (rrf_k + dense_rank)
+```
 
-	Read the returned text and compare it with the filing. The endpoint returns retrieved passages and scores; it does not ask Gemini to write an answer.
+Ranks are zero-based and `rrf_k` defaults to 60. The API exposes the fused score but not the individual ranks. RRF uses ranks rather than mixing raw BM25 and cosine scores.
 
-4. **Evaluate retrieval.** Try several questions: one using exact terms from the filing, one phrased differently from the filing, and one about a table value. For each, note whether a useful passage appears near the top and whether its section and table/prose type make sense. Treat incorrect or missing results as a retrieval issue to investigate, not as proof that the filing lacks the information.
+### Graph batches and persistence
 
-5. **Improve one thing at a time.** If useful evidence is missing, inspect the parsed text first, then the chunks, then the search rankings. Adjust parsing, chunk boundaries, or retrieval only after identifying which stage lost or failed to find the evidence. Retest the same questions after each change so results are comparable.
+`EntityGraph` accepts an injectable extractor. FastAPI exposes it through the `get_entity_extractor` dependency so tests can replace Gemini without network calls. The production extractor currently uses `gemini-3.1-flash-lite`, requests JSON, validates the returned entities/relationships, and sets a 60-second provider timeout.
 
-6. **Connect retrieval to Phase 1.** Once search returns useful evidence consistently, pass the top chunks into the Phase 1 model prompt as filing context. Return citations from the retrieved chunks' section and document metadata, and check that the generated response is supported by those passages. This is the next milestone: retrieval-grounded generation rather than search alone.
+Graph batches contain at most eight chunks and target roughly 12,000 characters. Batches do not mix document IDs; an oversized atomic table is sent intact. Graph extraction does not have the embedding retry/backoff policy.
 
-Remember: the index is in memory. If the server restarts, ingest the ticker again before searching. Avoid sending many SEC requests in quick succession; the fetcher includes a small delay to respect SEC request limits.
+Graphs are saved to `data/graphs/<sha256-of-ticker>.json` in NetworkX node-link format (`nodes` and `links`). The ticker is stored as graph metadata. Saving writes a temporary file followed by an atomic replacement; an extraction or disk failure leaves the previously published graph intact. The application reloads saved graphs on startup and logs/skips unreadable files. `/data/` is gitignored.
+
+| Data | Survives server restart? |
+|---|---|
+| Parsed chunks and BM25/dense indexes in `_indexes` | No; ingest again before search or graph rebuilding. |
+| Graph JSON in `data/graphs/` | Yes; relationship lookup works after startup reload without re-ingestion. |
+| Uploaded original PDF | No; the application does not save the uploaded source file. |
+
+Re-ingesting a ticker does not invalidate its old graph. Rebuild explicitly to refresh it. Storage and caches are intended for a single process; concurrent builds/multiple workers do not have coordination or cache synchronization.
+
+## Errors and troubleshooting
+
+| Situation | Current behavior |
+|---|---|
+| Unknown SEC ticker or no 10-K | SEC ingest returns 404. |
+| SEC rejection/network failure | SEC ingest returns 502; check its detail and the configured user-agent. |
+| Bad, empty, or image-only PDF | PDF ingest returns 400 with an explanation. |
+| Missing multipart fields, blank PDF label, or invalid chunk limit | PDF ingest returns 422. |
+| Search/build before ingestion | 404; ingest first. |
+| Graph lookup before building/loading | 404; build first. |
+| Missing Gemini key during ingestion/build | 503. |
+| Gemini rate limit during ingestion/build | 503; check quota and retry later. |
+| Other Gemini API failures during ingestion/build | 502. |
+| Malformed graph extraction output | Graph build returns 502. |
+| Graph disk persistence failure | Graph build returns 503 without publishing a partial graph. |
+
+PDF ingestion and graph building also translate transport failures into 502 responses. Error handling is not yet uniform: `/v2/search` does not currently translate Gemini failures, and the SEC ingest route does not catch all embedding transport failures. The synchronous SEC ingestion/search work still runs inside async routes and can block the event loop. These remain implementation gaps.
+
+## Tests and CI
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m pytest tests/test_html_parser.py tests/test_financial_chunker.py tests/test_hybrid_retriever.py -v
+```
+
+| Test file | Coverage |
+|---|---|
+| `tests/test_html_parser.py` | Empty HTML, table values/captions/order, and heading/whitespace normalization. |
+| `tests/test_financial_chunker.py` | TOC filtering, short/unknown sections, long prose, paragraph packing, atomic tables, and table context. |
+| `tests/test_hybrid_retriever.py` | Batch ordering, retries/backoff, failed rebuilds, shape validation, exact RRF scores/ranks, result limits, and repeatable fake-provider search. |
+| `tests/test_pdf_parser.py` | A PDF generated in the test, extraction order, blank cells, upload/search, invalid PDFs, and provider transport errors. |
+| `tests/test_entity_graph_api.py` | Fake extraction, batching, both relationship directions, persistence/startup reload, malformed output, provider errors, and disk failure. |
+
+`.github/workflows/ci.yml` installs `requirements.txt` and runs `python -m pytest` on every push using Ubuntu and Python 3.12. No Gemini credentials or SEC requests are required for this suite.
+
+## Remaining work and next milestone
+
+- Validate live SEC filings, real embeddings, and entity extraction; offline tests verify mechanics rather than answer quality.
+- Index beyond the current 100-chunk API cap or choose an explicit document coverage policy.
+- Persist search indexes and source documents; coordinate updates across workers.
+- Improve complex HTML/PDF layouts, nested tables, merged cells, borderless tables, and multipage tables. PDF OCR is absent; a table spanning pages may be detected as separate tables.
+- Improve caption/units and section detection, and evaluate prose overlap where context crosses boundaries.
+- Return `chunk_id`, filing date, and source URL in search results for complete citations. Section title and document ID are already available.
+- Validate search `k`, standardize provider error responses, and move blocking work out of async routes.
+- Add entity enumeration, aliases/case normalization, deduplication, chunk-level graph provenance, and graph freshness tracking. Current lookups are one hop and repeated extracted edges may remain parallel edges.
+- Move the hardcoded SEC user-agent into configuration.
+- Connect top retrieved chunks to Phase 1 prompts and citations, instruct the model to acknowledge insufficient evidence, and measure retrieval precision/recall and answer faithfulness on a small evaluation set.
+
+The next milestone is retrieval-grounded generation: ingest, retrieve evidence, pass it into Phase 1, and stream an answer whose citations identify the source chunks.

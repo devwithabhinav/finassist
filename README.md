@@ -17,4 +17,4 @@ To run on Windows:
 * then run "pip install -r requirements.txt". This is Python's packages.config
 * To run the project root: `uvicorn app.main:app --reload`
 * API models: download Ollama from "ollama.com"
-
+* http://127.0.0.1:8000/docs#/
